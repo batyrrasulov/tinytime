@@ -6,7 +6,7 @@
  */
 
 #define APP_NAME "TinyTime"
-#define APP_VERSION "2.0"
+#define APP_VERSION "2.0.1"
 
 #define TICK_MS 1000
 #define POLL_MS 10
