@@ -27,7 +27,7 @@ static uint8_t seven_seg_encode(uint8_t digit)
 /*
  * driver_init
  * Opens the Linux character devices for keys, switches, LEDs, and HEX.
- * Returns 0 when all devices are available, or -1 when entering stub mode.
+ * Returns 0 when all devices are available, or -1 on failure.
  */
 int driver_init(DriverContext *ctx, const char *keys_path, const char *switches_path,
                 const char *leds_path, const char *hex_path)
@@ -50,9 +50,8 @@ int driver_init(DriverContext *ctx, const char *keys_path, const char *switches_
     ctx->fd_hex = open(hex_path, O_WRONLY);
 
     if (ctx->fd_keys < 0 || ctx->fd_switches < 0 || ctx->fd_leds < 0 || ctx->fd_hex < 0) {
-        fprintf(stderr, "Driver backend not ready (%s). Using stub data.\n", strerror(errno));
+        fprintf(stderr, "Driver backend not ready (%s).\n", strerror(errno));
         driver_close(ctx);
-        ctx->stub_mode = true;
         return -1;
     }
 
@@ -90,24 +89,15 @@ void driver_close(DriverContext *ctx)
 
 /*
  * driver_read_switches
- * Reads a 32-bit switch value from the driver or returns stub data.
- *
- * Pseudocode (stub mode):
- *   increment stub_counter
- *   synthesize a repeating pattern within SW_MASK
- *   return pattern
+ * Reads a 32-bit switch value from the driver.
  */
 uint32_t driver_read_switches(DriverContext *ctx)
 {
     uint32_t value = 0;
     ssize_t rc = 0;
 
-    if (!ctx || ctx->stub_mode) {
-        if (ctx) {
-            ctx->stub_counter++;
-            value = (ctx->stub_counter >> 2u) & SW_MASK;
-        }
-        return value;
+    if (!ctx || ctx->fd_switches < 0) {
+        return 0;
     }
 
     rc = read(ctx->fd_switches, &value, sizeof(value));
@@ -120,27 +110,15 @@ uint32_t driver_read_switches(DriverContext *ctx)
 
 /*
  * driver_read_keys
- * Reads a 32-bit key value from the driver or returns stub data.
- *
- * Pseudocode (stub mode):
- *   increment stub_counter
- *   toggle KEY0 on alternating reads
- *   return synthesized key bits
+ * Reads a 32-bit key value from the driver.
  */
 uint32_t driver_read_keys(DriverContext *ctx)
 {
     uint32_t value = 0;
     ssize_t rc = 0;
 
-    if (!ctx || ctx->stub_mode) {
-        if (ctx) {
-            ctx->stub_counter++;
-            value = KEY_MASK;
-            if ((ctx->stub_counter & 0x1u) != 0u) {
-                value &= ~KEY0_MASK;
-            }
-        }
-        return value;
+    if (!ctx || ctx->fd_keys < 0) {
+        return 0;
     }
 
     rc = read(ctx->fd_keys, &value, sizeof(value));
@@ -153,13 +131,13 @@ uint32_t driver_read_keys(DriverContext *ctx)
 
 /*
  * driver_write_leds
- * Writes LED bitfields to the driver or no-ops in stub mode.
+ * Writes LED bitfields to the driver.
  */
 void driver_write_leds(DriverContext *ctx, uint32_t bits)
 {
     ssize_t rc = 0;
 
-    if (!ctx || ctx->stub_mode) {
+    if (!ctx || ctx->fd_leds < 0) {
         return;
     }
 
@@ -169,14 +147,14 @@ void driver_write_leds(DriverContext *ctx, uint32_t bits)
 
 /*
  * driver_write_hex_digits
- * Writes packed BCD digits to the driver or no-ops in stub mode.
+ * Writes packed BCD digits to the driver.
  */
 int driver_write_hex_digits(DriverContext *ctx, const uint8_t digits[4])
 {
     uint32_t value = 0;
     ssize_t rc = 0;
 
-    if (!ctx || !digits || ctx->stub_mode) {
+    if (!ctx || !digits || ctx->fd_hex < 0) {
         return -1;
     }
 

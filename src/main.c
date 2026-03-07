@@ -10,9 +10,13 @@
 #include "hw_io.h"
 #include "time_utils.h"
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef struct {
     uint32_t stable;
@@ -30,6 +34,8 @@ typedef struct {
 } IoBackend;
 
 static volatile sig_atomic_t g_stop = 0;
+static struct termios g_saved_termios;
+static int g_termios_active = 0;
 
 /*
  * handle_sigint
@@ -39,6 +45,75 @@ static void handle_sigint(int sig)
 {
     (void)sig;
     g_stop = 1;
+}
+
+/*
+ * restore_terminal_mode
+ * Restores the SSH terminal to its prior settings.
+ */
+static void restore_terminal_mode(void)
+{
+    if (g_termios_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+        g_termios_active = 0;
+    }
+}
+
+/*
+ * enable_terminal_mode
+ * Enables noncanonical no-echo input so single-key commands can be read.
+ */
+static int enable_terminal_mode(void)
+{
+    struct termios raw;
+
+    if (!isatty(STDIN_FILENO)) {
+        return -1;
+    }
+    if (tcgetattr(STDIN_FILENO, &g_saved_termios) != 0) {
+        return -1;
+    }
+
+    raw = g_saved_termios;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+        return -1;
+    }
+
+    g_termios_active = 1;
+    atexit(restore_terminal_mode);
+    return 0;
+}
+
+/*
+ * poll_terminal_command
+ * Returns one pending command character from stdin, or 0 if none is ready.
+ */
+static int poll_terminal_command(void)
+{
+    fd_set readfds;
+    struct timeval timeout;
+    unsigned char ch = 0;
+
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+
+    if (select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout) <= 0) {
+        return 0;
+    }
+    if (!FD_ISSET(STDIN_FILENO, &readfds)) {
+        return 0;
+    }
+    if (read(STDIN_FILENO, &ch, 1) != 1) {
+        return 0;
+    }
+
+    return (int)ch;
 }
 
 /*
@@ -71,6 +146,25 @@ static uint32_t debounce_update(Debouncer *d, uint32_t raw, uint64_t now_ms)
 }
 
 /*
+ * debounce_update_with_window
+ * Updates a debouncer using a caller-supplied debounce interval.
+ */
+static uint32_t debounce_update_with_window(Debouncer *d, uint32_t raw, uint64_t now_ms,
+                                            uint64_t debounce_ms)
+{
+    if (raw != d->last_raw) {
+        d->last_raw = raw;
+        d->last_change_ms = now_ms;
+    }
+
+    if ((now_ms - d->last_change_ms) >= debounce_ms) {
+        d->stable = d->last_raw;
+    }
+
+    return d->stable;
+}
+
+/*
  * normalize_bits
  * Applies masking and active-low conversion to raw bits.
  */
@@ -83,6 +177,28 @@ static uint32_t normalize_bits(uint32_t raw, uint32_t mask, int active_low)
     }
 
     return bits;
+}
+
+/*
+ * print_sw_bits
+ * Prints the low 10 switch bits from MSB to LSB.
+ */
+/*
+ * emulate_key_raw_from_switches
+ * Synthesizes the active-low KEY register value from SW1/SW2.
+ */
+static uint32_t emulate_key_raw_from_switches(uint32_t raw_sw)
+{
+    uint32_t raw_key = 0u;
+
+    if (raw_sw & SW1_MASK) {
+        raw_key |= KEY0_MASK;
+    }
+    if (raw_sw & SW2_MASK) {
+        raw_key |= KEY1_MASK;
+    }
+
+    return raw_key;
 }
 
 /*
@@ -176,7 +292,8 @@ static void run_probe(const IoBackend *io)
     uint64_t next_led = start;
     uint64_t next_sw = start;
     uint32_t last_key = io->read_keys(io->ctx);
-    uint32_t pattern = 0;
+    uint32_t led_bit = 0;
+    uint32_t pattern = 1u;
 
     printf("Probe: blinking LEDs and sampling SW/KEY for ~5 seconds.\n");
 
@@ -184,8 +301,9 @@ static void run_probe(const IoBackend *io)
         now = time_now_ms();
 
         if (now >= next_led) {
-            pattern = (pattern + 1u) & 0x3u;
+            pattern = 1u << led_bit;
             io->write_leds(io->ctx, pattern);
+            led_bit = (led_bit + 1u) % 10u;
             next_led += 1000u;
         }
 
@@ -243,94 +361,68 @@ static void run_probe_hex(const IoBackend *io)
 static void run_app(const IoBackend *io)
 {
     AppState state;
-    Debouncer key_db;
     uint64_t last_tick = time_now_ms();
     uint64_t last_log = last_tick;
-    uint32_t last_sw0 = 0;
+    uint32_t terminal_sw_bits = SW0_MASK;
+    uint32_t pending_key_bits = 0u;
+    int terminal_mode_ready = 0;
 
-#if EMULATE_KEY_WITH_SW
     printf("%s v%s starting.\n", APP_NAME, APP_VERSION);
     printf("\n");
     printf("=== CONTROLS ===\n");
-    printf("SW0 (rightmost switch):  Mode select (DOWN=clock, UP=stopwatch)\n");
-    printf("SW1 (2nd from right):    START/STOP (flip DOWN to press, UP to release)\n");
-    printf("SW2 (3rd from right):    RESET (flip DOWN to reset time)\n");
+    printf("m = toggle clock/stopwatch mode\n");
+    printf("s = start/stop stopwatch\n");
+    printf("r = reset stopwatch to 00:00\n");
+    printf("q = quit\n");
     printf("\n");
-    printf("(Using SW1/SW2 to emulate KEY0/KEY1 - FPGA bitstream KEY buttons don't work)\n");
-    printf("WATCH FOR '[SW CHANGED]' messages when you flip switches!\n");
-    printf("\n");
-#else
-    printf("%s v%s starting. SW0=mode (0=clock,1=stopwatch). KEY0=start/stop, KEY1=reset.\n", APP_NAME,
-           APP_VERSION);
-#endif
 
     app_init(&state);
+    terminal_mode_ready = (enable_terminal_mode() == 0);
 
     {
-        uint32_t raw_sw = io->read_switches(io->ctx);
-        uint32_t raw_key = io->read_keys(io->ctx);
-        uint32_t norm_sw = normalize_bits(raw_sw, SW_MASK, SW_ACTIVE_LOW);
-        uint32_t norm_key = normalize_bits(raw_key, KEY_MASK, KEY_ACTIVE_LOW);
-        debounce_init(&key_db, norm_key, last_tick);
-        last_sw0 = norm_sw & SW0_MASK;
-        printf("Initial SW=0x%08x KEY=0x%08x\n", norm_sw, norm_key);
+        app_step(&state, terminal_sw_bits, 0u, 0u);
+        printf("Initial MODE=Stopwatch TIME=00:00\n");
+        if (!terminal_mode_ready) {
+            printf("Warning: terminal raw mode unavailable; commands may require Enter.\n");
+        }
     }
 
-    {
-        static uint32_t last_raw_key = 0xFFFFFFFF;
-        static uint32_t last_raw_sw = 0xFFFFFFFF;
-        
     while (!g_stop) {
         uint64_t now = time_now_ms();
-        uint32_t raw_sw = io->read_switches(io->ctx);
-        uint32_t raw_key = io->read_keys(io->ctx);
-        
-        if (raw_sw != last_raw_sw) {
-            printf("[SW CHANGED] 0x%08x -> 0x%08x  SW0=%d SW1=%d SW2=%d\n",
-                   last_raw_sw, raw_sw,
-                   (raw_sw & SW0_MASK) ? 1 : 0,
-                   (raw_sw & SW1_MASK) ? 1 : 0,
-                   (raw_sw & SW2_MASK) ? 1 : 0);
-            last_raw_sw = raw_sw;
+        uint32_t elapsed_seconds = 0u;
+        uint32_t key_bits = 0u;
+        int cmd = poll_terminal_command();
+
+        if (cmd == 'q' || cmd == 'Q') {
+            g_stop = 1;
+            continue;
         }
-        
-#if EMULATE_KEY_WITH_SW
-        /* Emulate KEY using SW when bitstream doesn't have working KEY buttons.
-         * SW1 (bit 1) -> KEY0 (bit 0)
-         * SW2 (bit 2) -> KEY1 (bit 1)
-         * Active-low: SW pressed (0) becomes KEY pressed (0)
-         */
-        raw_key = 0x00000000;  // Start with all keys pressed (active-low)
-        if (raw_sw & SW1_MASK) raw_key |= KEY0_MASK;  // SW1 up = KEY0 released
-        if (raw_sw & SW2_MASK) raw_key |= KEY1_MASK;  // SW2 up = KEY1 released
-#endif
-        
-        uint32_t norm_sw = normalize_bits(raw_sw, SW_MASK, SW_ACTIVE_LOW);
-        uint32_t norm_key = normalize_bits(raw_key, KEY_MASK, KEY_ACTIVE_LOW);
-        uint32_t debounced_key = debounce_update(&key_db, norm_key, now);
-        uint32_t sw_bits = norm_sw;
-        uint32_t key_bits = debounced_key;
-        int one_second = 0;
-        
-        if (raw_key != last_raw_key) {
-            printf("[RAW KEY CHANGE] 0x%08x -> 0x%08x (norm=0x%08x, dbounce=0x%08x)\n", 
-                   last_raw_key, raw_key, norm_key, debounced_key);
-            last_raw_key = raw_key;
+        if (cmd == 'm' || cmd == 'M') {
+            if ((terminal_sw_bits & SW0_MASK) != 0u) {
+                terminal_sw_bits &= ~SW0_MASK;
+                printf("[CMD] mode -> clock\n");
+            } else {
+                terminal_sw_bits |= SW0_MASK;
+                printf("[CMD] mode -> stopwatch\n");
+            }
+        } else if (cmd == 's' || cmd == 'S') {
+            pending_key_bits |= KEY0_MASK;
+            printf("[CMD] start/stop\n");
+        } else if (cmd == 'r' || cmd == 'R') {
+            pending_key_bits |= KEY1_MASK;
+            printf("[CMD] reset\n");
         }
+        key_bits = pending_key_bits;
 
         while ((now - last_tick) >= TICK_MS) {
             last_tick += TICK_MS;
-            one_second = 1;
+            elapsed_seconds++;
         }
 
-        app_step(&state, sw_bits, key_bits, one_second != 0);
+        app_step(&state, terminal_sw_bits, key_bits, elapsed_seconds);
+        pending_key_bits = 0u;
 
-        if ((sw_bits & SW0_MASK) != last_sw0) {
-            last_sw0 = sw_bits & SW0_MASK;
-            // printf("SW0 changed: %u\n", (last_sw0 != 0u) ? 1u : 0u);
-        }
-
-        if (one_second) {
+        {
             uint8_t digits[4];
             uint32_t leds = 0;
             char mode_char = (state.mode == APP_MODE_STOPWATCH) ? 'S' : 'C';
@@ -347,16 +439,17 @@ static void run_app(const IoBackend *io)
             io->write_leds(io->ctx, leds);
 
             if ((now - last_log) >= TICK_MS) {
-                printf("MODE=%c RUN=%u TIME=%02u:%02u SW=0x%08x KEY=0x%08x\n",
+                printf("MODE=%c RUN=%u TIME=%02u:%02u CMD_SW0=%u\n",
                        mode_char, state.running ? 1u : 0u, state.time.min, state.time.sec,
-                       raw_sw, raw_key);
+                       (terminal_sw_bits & SW0_MASK) ? 1u : 0u);
                 last_log = now;
             }
         }
 
         sleep_ms(POLL_MS);
     }
-    }
+
+    restore_terminal_mode();
 }
 
 int main(int argc, char **argv)
@@ -391,7 +484,10 @@ int main(int argc, char **argv)
     printf("%s v%s\n", APP_NAME, APP_VERSION);
 
     if (use_driver) {
-        (void)driver_init(&driver_ctx, DRIVER_KEYS_DEV, DRIVER_SWITCHES_DEV, DRIVER_LEDS_DEV, DRIVER_HEX_DEV);
+        if (driver_init(&driver_ctx, DRIVER_KEYS_DEV, DRIVER_SWITCHES_DEV, DRIVER_LEDS_DEV, DRIVER_HEX_DEV) != 0) {
+            fprintf(stderr, "Driver backend initialization failed. Use MMIO mode on this board.\n");
+            return 1;
+        }
         io.ctx = &driver_ctx;
         io.read_switches = driver_read_switches_wrap;
         io.read_keys = driver_read_keys_wrap;

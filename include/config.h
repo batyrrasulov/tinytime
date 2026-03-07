@@ -33,6 +33,12 @@
 #define KEY_ACTIVE_LOW 1
 #define SW_ACTIVE_LOW 0
 
+/*
+ * Use terminal commands over the SSH session as the primary control path.
+ * This avoids unstable FPGA switch inputs on the current board image.
+ */
+#define TERMINAL_CONTROL_MODE 1
+
 #define DEFAULT_MMIO_SPAN 0x1000u
 
 /*

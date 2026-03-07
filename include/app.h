@@ -29,8 +29,9 @@ void app_init(AppState *state);
 
 /*
  * app_step
- * Advances the application state based on inputs and the 1 Hz tick.
+ * Advances the application state based on inputs and the number of elapsed
+ * whole-second ticks since the previous update.
  */
-void app_step(AppState *state, uint32_t sw_bits, uint32_t key_bits, bool one_second);
+void app_step(AppState *state, uint32_t sw_bits, uint32_t key_bits, uint32_t elapsed_seconds);
 
 #endif
