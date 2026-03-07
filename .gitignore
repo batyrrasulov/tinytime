@@ -1,5 +1,19 @@
+# Build artifacts
 tinytime
 *.o
 *.out
 *.log
 .DS_Store
+
+# Explicitly ignore current local-only files (11 requested)
+Milestone3_Iteration2_Release.md
+compare_pio.c
+config_key.c
+scan_key.c
+test_key.c
+src/app.o
+src/driver_io.o
+src/hw_io_mmio.o
+src/main.o
+src/time_utils.o
+tinytime
