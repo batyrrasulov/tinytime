@@ -1,5 +1,8 @@
 # Build artifacts
 tinytime
+
+# Local documentation bundle
+.docs/
 *.o
 *.out
 *.log
