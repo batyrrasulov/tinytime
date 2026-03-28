@@ -146,25 +146,6 @@ static uint32_t debounce_update(Debouncer *d, uint32_t raw, uint64_t now_ms)
 }
 
 /*
- * debounce_update_with_window
- * Updates a debouncer using a caller-supplied debounce interval.
- */
-static uint32_t debounce_update_with_window(Debouncer *d, uint32_t raw, uint64_t now_ms,
-                                            uint64_t debounce_ms)
-{
-    if (raw != d->last_raw) {
-        d->last_raw = raw;
-        d->last_change_ms = now_ms;
-    }
-
-    if ((now_ms - d->last_change_ms) >= debounce_ms) {
-        d->stable = d->last_raw;
-    }
-
-    return d->stable;
-}
-
-/*
  * normalize_bits
  * Applies masking and active-low conversion to raw bits.
  */
@@ -177,28 +158,6 @@ static uint32_t normalize_bits(uint32_t raw, uint32_t mask, int active_low)
     }
 
     return bits;
-}
-
-/*
- * print_sw_bits
- * Prints the low 10 switch bits from MSB to LSB.
- */
-/*
- * emulate_key_raw_from_switches
- * Synthesizes the active-low KEY register value from SW1/SW2.
- */
-static uint32_t emulate_key_raw_from_switches(uint32_t raw_sw)
-{
-    uint32_t raw_key = 0u;
-
-    if (raw_sw & SW1_MASK) {
-        raw_key |= KEY0_MASK;
-    }
-    if (raw_sw & SW2_MASK) {
-        raw_key |= KEY1_MASK;
-    }
-
-    return raw_key;
 }
 
 /*
@@ -220,7 +179,7 @@ static void sleep_ms(unsigned int ms)
  */
 static void print_usage(const char *prog)
 {
-    printf("Usage: %s [--print-addrs|--probe|--probe-hex|--use-driver]\n", prog);
+    printf("Usage: %s [--print-addrs|--probe|--probe-hex|--use-driver|--custom-fpga|--use-class-addrs]\n", prog);
 }
 
 /*
@@ -357,8 +316,11 @@ static void run_probe_hex(const IoBackend *io)
 /*
  * run_app
  * Main application loop.
+ * When custom_fpga is nonzero, physical SW/KEY inputs are read alongside
+ * terminal commands.  Physical switches take priority; key presses from
+ * both sources are combined (OR).
  */
-static void run_app(const IoBackend *io)
+static void run_app(const IoBackend *io, int custom_fpga)
 {
     AppState state;
     uint64_t last_tick = time_now_ms();
@@ -366,7 +328,10 @@ static void run_app(const IoBackend *io)
     uint32_t terminal_sw_bits = SW0_MASK;
     uint32_t pending_key_bits = 0u;
     int terminal_mode_ready = 0;
+    Debouncer sw_deb = {0, 0, 0};
+    Debouncer key_deb = {0, 0, 0};
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
     printf("%s v%s starting.\n", APP_NAME, APP_VERSION);
     printf("\n");
     printf("=== CONTROLS ===\n");
@@ -374,14 +339,26 @@ static void run_app(const IoBackend *io)
     printf("s = start/stop stopwatch\n");
     printf("r = reset stopwatch to 00:00\n");
     printf("q = quit\n");
+    if (custom_fpga) {
+        printf("\nCustom FPGA mode: physical SW/KEY inputs active.\n");
+    }
     printf("\n");
 
     app_init(&state);
     terminal_mode_ready = (enable_terminal_mode() == 0);
 
+    if (custom_fpga) {
+        uint64_t now = time_now_ms();
+        uint32_t raw_sw = io->read_switches(io->ctx);
+        uint32_t raw_key = io->read_keys(io->ctx);
+        debounce_init(&sw_deb, normalize_bits(raw_sw, SW_MASK, SW_ACTIVE_LOW), now);
+        debounce_init(&key_deb, normalize_bits(raw_key, KEY_MASK, KEY_ACTIVE_LOW), now);
+    }
+
     {
-        app_step(&state, terminal_sw_bits, 0u, 0u);
-        printf("Initial MODE=Stopwatch TIME=00:00\n");
+        /* Auto-start: send KEY0 press to begin stopwatch immediately */
+        app_step(&state, terminal_sw_bits, KEY0_MASK, 0u);
+        printf("Initial MODE=Stopwatch TIME=00:00 (auto-started)\n");
         if (!terminal_mode_ready) {
             printf("Warning: terminal raw mode unavailable; commands may require Enter.\n");
         }
@@ -390,6 +367,7 @@ static void run_app(const IoBackend *io)
     while (!g_stop) {
         uint64_t now = time_now_ms();
         uint32_t elapsed_seconds = 0u;
+        uint32_t sw_bits = terminal_sw_bits;
         uint32_t key_bits = 0u;
         int cmd = poll_terminal_command();
 
@@ -412,14 +390,27 @@ static void run_app(const IoBackend *io)
             pending_key_bits |= KEY1_MASK;
             printf("[CMD] reset\n");
         }
-        key_bits = pending_key_bits;
+
+        /* Build final input bits */
+        if (custom_fpga) {
+            uint32_t raw_sw = io->read_switches(io->ctx);
+            uint32_t raw_key = io->read_keys(io->ctx);
+            sw_bits = debounce_update(&sw_deb,
+                          normalize_bits(raw_sw, SW_MASK, SW_ACTIVE_LOW), now);
+            key_bits = debounce_update(&key_deb,
+                           normalize_bits(raw_key, KEY_MASK, KEY_ACTIVE_LOW), now);
+            key_bits |= pending_key_bits;
+        } else {
+            sw_bits = terminal_sw_bits;
+            key_bits = pending_key_bits;
+        }
 
         while ((now - last_tick) >= TICK_MS) {
             last_tick += TICK_MS;
             elapsed_seconds++;
         }
 
-        app_step(&state, terminal_sw_bits, key_bits, elapsed_seconds);
+        app_step(&state, sw_bits, key_bits, elapsed_seconds);
         pending_key_bits = 0u;
 
         {
@@ -462,6 +453,8 @@ int main(int argc, char **argv)
     int do_probe = 0;
     int do_probe_hex = 0;
     int use_driver = 0;
+    int custom_fpga = CUSTOM_FPGA;
+    int use_class_addrs = 0;
     int i = 0;
 
     for (i = 1; i < argc; i++) {
@@ -473,6 +466,10 @@ int main(int argc, char **argv)
             do_probe_hex = 1;
         } else if (strcmp(argv[i], "--use-driver") == 0) {
             use_driver = 1;
+        } else if (strcmp(argv[i], "--custom-fpga") == 0) {
+            custom_fpga = 1;
+        } else if (strcmp(argv[i], "--use-class-addrs") == 0) {
+            use_class_addrs = 1;
         } else {
             print_usage(argv[0]);
             return 1;
@@ -501,9 +498,11 @@ int main(int argc, char **argv)
             return 1;
         }
     } else {
-        if (hw_discover_addresses(&addrs) != 0) {
+        if (use_class_addrs) {
+            hw_set_class_addrs(&addrs);
+        } else if (hw_discover_addresses(&addrs) != 0) {
             hw_print_addrs(&addrs);
-            fprintf(stderr, "Address discovery incomplete.\n");
+            fprintf(stderr, "Address discovery incomplete. Try --use-class-addrs.\n");
             return 1;
         }
 
@@ -512,9 +511,21 @@ int main(int argc, char **argv)
             return 0;
         }
 
+        /* Override HEX format for custom FPGA (BCD decoded in hardware) */
+        if (custom_fpga) {
+            addrs.hex_format = HEX_FORMAT_PACKED_BCD;
+        }
+
         if (hw_init(&ctx, &addrs) != 0) {
             fprintf(stderr, "Failed to initialize MMIO.\n");
             return 1;
+        }
+
+        /* Clear HEX5-HEX4 register (0xFF200030) so stale digits don't linger */
+        if (ctx.hex_map) {
+            volatile uint32_t *hex54 = (volatile uint32_t *)
+                ((uint8_t *)ctx.hex_map + ctx.hex_offset + 0x10u);
+            *hex54 = 0;
         }
 
         io.ctx = &ctx;
@@ -537,7 +548,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    run_app(&io);
+    run_app(&io, custom_fpga);
     io.close(io.ctx);
     return 0;
 }

@@ -54,6 +54,12 @@ typedef struct {
 int hw_discover_addresses(HwAddrs *out);
 
 /*
+ * hw_set_class_addrs
+ * Overwrites addresses with the DE10-Standard Computer defaults.
+ */
+void hw_set_class_addrs(HwAddrs *out);
+
+/*
  * hw_print_addrs
  * Prints discovered address ranges to stdout.
  */

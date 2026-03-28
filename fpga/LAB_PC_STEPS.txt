@@ -1,0 +1,219 @@
+==============================================================
+  TinyTime FPGA — LAB PC STEP-BY-STEP GUIDE
+  (No internet needed. Everything is on the USB drive.)
+==============================================================
+
+WHAT YOU NEED:
+  - USB drive with the entire tinytime/ project
+  - Lab PC with Quartus installed
+  - DE10-Standard Computer project (on USB under
+    .docs/DE10-Standard_Computer/verilog/ OR already
+    on the lab PC from class)
+
+==============================================================
+OPTION A: ONE-CLICK BUILD (RECOMMENDED)
+==============================================================
+
+1. Plug USB drive into lab PC
+
+2. Open Command Prompt (cmd) or PowerShell
+
+3. Navigate to the fpga folder on your USB:
+     cd D:\tinytime\fpga
+   (Replace D: with your USB drive letter)
+
+4. Run the build script:
+     build_all.bat C:\path\to\DE10_Standard_Computer\verilog
+
+   OR if the project is on the USB:
+     build_all.bat D:\tinytime\.docs\DE10-Standard_Computer\verilog
+
+5. Wait 15-30 minutes for compilation.
+
+6. When done, copy the .rbf file to the board:
+     - From Mac terminal:
+       scp /path/to/DE10_Standard_Computer.rbf root@192.168.1.123:/root/
+     - Then SSH and flash:
+       ssh root@192.168.1.123
+       cp /root/DE10_Standard_Computer.rbf /media/fat_partition/soc_system.rbf
+       reboot
+
+7. After reboot, run:
+     ./tinytime --custom-fpga --use-class-addrs
+
+==============================================================
+OPTION B: MANUAL STEPS (IF SCRIPT FAILS)
+==============================================================
+
+If build_all.bat fails at any step, follow these manual steps.
+
+--- STEP 1: COPY FILES ---
+
+1. Copy these files into the Quartus project's ip\tinytime\ folder
+   (create the folder if it doesn't exist):
+
+   From fpga/rtl/:
+     bcd_to_7seg.v
+     hex_decoder.v
+     key_debouncer.v
+
+   From fpga/ip/:
+     hex_decoder_hw.tcl
+     key_debouncer_hw.tcl
+
+--- STEP 2: PLATFORM DESIGNER ---
+
+1. Open Quartus -> File -> Open Project -> DE10_Standard_Computer.qpf
+2. Tools -> Platform Designer -> Open Computer_System.qsys
+3. Wait for it to load
+
+4. ADD IP SEARCH PATH:
+   - IP Catalog panel -> right-click -> "Add IP Search Path..."
+   - Navigate to: ip\tinytime\
+   - Click OK
+   - "TinyTime Custom" group should appear
+
+5. ADD HEX DECODER:
+   - Find "BCD to 7-Seg HEX Decoder (TinyTime)" -> double-click
+   - Click Finish
+   - Connect hex_decoder_0.clock -> clk_0.clk
+   - Connect hex_decoder_0.reset -> clk_0.clk_reset
+   - Connect hex_decoder_0.avs -> ARM_A9_HPS.h2f_lw_axi_master
+   - Set base address = 0x00000020
+   - Export hex_conduit -> name it: hex_decoder_0_hex_conduit
+
+6. ADD KEY DEBOUNCER:
+   - Find "Hardware Key Debouncer (TinyTime)" -> double-click
+   - Click Finish
+   - Connect key_debouncer_0.clock -> clk_0.clk
+   - Connect key_debouncer_0.reset -> clk_0.clk_reset
+   - Connect key_debouncer_0.avs -> ARM_A9_HPS.h2f_lw_axi_master
+   - Set base address = 0x00000050
+   - Export key_conduit -> name it: key_debouncer_0_key_conduit
+
+7. REMOVE OLD COMPONENTS:
+   - Right-click HEX3_HEX0 -> Remove
+   - Right-click HEX5_HEX4 -> Remove
+   - Right-click Pushbuttons -> Remove
+
+8. Generate HDL -> Click Generate -> Wait -> Finish
+
+--- STEP 3: REPLACE TOP-LEVEL VERILOG ---
+
+1. Copy fpga/quartus/DE10_Standard_Computer_modified.v over the
+   existing DE10_Standard_Computer.v in the project folder.
+
+   OR make these edits manually:
+
+   a) REPLACE the wire declarations + HEX assigns:
+
+      OLD:
+        wire [31:0] hex3_hex0;
+        wire [15:0] hex5_hex4;
+        assign HEX0 = ~hex3_hex0[ 6: 0];
+        assign HEX1 = ~hex3_hex0[14: 8];
+        assign HEX2 = ~hex3_hex0[22:16];
+        assign HEX3 = ~hex3_hex0[30:24];
+        assign HEX4 = ~hex5_hex4[ 6: 0];
+        assign HEX5 = ~hex5_hex4[14: 8];
+
+      NEW:
+        wire [6:0] hex_dec_hex0;
+        wire [6:0] hex_dec_hex1;
+        wire [6:0] hex_dec_hex2;
+        wire [6:0] hex_dec_hex3;
+        wire [6:0] hex_dec_hex4;
+        wire [6:0] hex_dec_hex5;
+        assign HEX0 = ~hex_dec_hex0;
+        assign HEX1 = ~hex_dec_hex1;
+        assign HEX2 = ~hex_dec_hex2;
+        assign HEX3 = ~hex_dec_hex3;
+        assign HEX4 = ~hex_dec_hex4;
+        assign HEX5 = ~hex_dec_hex5;
+
+   b) In the Computer_System instantiation, REPLACE:
+
+      OLD:
+        .pushbuttons_export    (~KEY[3:0]),
+        ...
+        .hex3_hex0_export      (hex3_hex0),
+        .hex5_hex4_export      (hex5_hex4),
+
+      NEW:
+        .key_debouncer_0_key_conduit_key_in (KEY),
+        ...
+        .hex_decoder_0_hex_conduit_hex0     (hex_dec_hex0),
+        .hex_decoder_0_hex_conduit_hex1     (hex_dec_hex1),
+        .hex_decoder_0_hex_conduit_hex2     (hex_dec_hex2),
+        .hex_decoder_0_hex_conduit_hex3     (hex_dec_hex3),
+        .hex_decoder_0_hex_conduit_hex4     (hex_dec_hex4),
+        .hex_decoder_0_hex_conduit_hex5     (hex_dec_hex5),
+
+      NOTE: KEY is passed WITHOUT ~ inversion!
+
+--- STEP 4: ADD SOURCE FILES ---
+
+1. Project -> Add/Remove Files in Project
+2. Add these from ip\tinytime\:
+   - bcd_to_7seg.v
+   - hex_decoder.v
+   - key_debouncer.v
+
+--- STEP 5: COMPILE ---
+
+1. Processing -> Start Compilation (Ctrl+L)
+2. Wait 10-30 minutes
+3. Check for green "Compilation was successful"
+
+--- STEP 6: GENERATE .RBF ---
+
+From command line:
+  quartus_cpf -c output_files\DE10_Standard_Computer.sof DE10_Standard_Computer.rbf
+
+Or from Quartus:
+  File -> Convert Programming Files
+    Type: Raw Binary File (.rbf)
+    Input: output_files/DE10_Standard_Computer.sof
+    Click Generate
+
+--- STEP 7: FLASH TO BOARD ---
+
+Copy .rbf to board and flash (from Mac):
+
+  scp DE10_Standard_Computer.rbf root@192.168.1.123:/root/
+  ssh root@192.168.1.123
+  cp /root/DE10_Standard_Computer.rbf /media/fat_partition/soc_system.rbf
+  reboot
+
+Wait ~30 seconds for board to boot back up, then:
+
+  ssh root@192.168.1.123
+  cd /root/tinytime
+  ./tinytime --custom-fpga --use-class-addrs
+
+==============================================================
+TROUBLESHOOTING
+==============================================================
+
+ERROR: "Can't find port X"
+  -> Port name mismatch in top-level Verilog. The exact port
+    names depend on what Platform Designer named the exports.
+    Look at the generated Computer_System.v for the actual names.
+
+ERROR: "Multiple drivers on net"
+  -> You left the old hex3_hex0 wire AND added hex_dec wires.
+    Remove the old wire declarations.
+
+ERROR: qsys-script fails with "unknown component"
+  -> IP search path not set. Make sure ip\tinytime\ contains
+    the _hw.tcl files AND the .v files.
+
+ERROR: Compilation takes forever / runs out of memory
+  -> Close all other programs. DE10-Standard is a big FPGA.
+    On an old PC, compilation can take 30+ minutes.
+
+COMPILATION SUCCEEDS BUT BOARD DOESN'T WORK
+  -> Make sure you copied the NEW .rbf (check file size --
+    should be ~3.7MB, similar to the original).
+  -> Run with: ./tinytime --custom-fpga --use-class-addrs
+    (the --custom-fpga flag switches HEX to packed BCD mode)

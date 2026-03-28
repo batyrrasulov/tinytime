@@ -1,0 +1,87 @@
+=====================================================
+EDITS TO: DE10_Standard_Computer.v (the STOCK/ORIGINAL one)
+=====================================================
+You are making 2 edits to this file. That's it.
+
+
+=====================================================
+EDIT 1 of 2 — Replace the REG/WIRE section
+=====================================================
+
+FIND this block (around line 195-205):
+
+wire        [31: 0] hex3_hex0;
+wire        [15: 0] hex5_hex4;
+
+assign HEX0 = ~hex3_hex0[ 6: 0];
+assign HEX1 = ~hex3_hex0[14: 8];
+assign HEX2 = ~hex3_hex0[22:16];
+assign HEX3 = ~hex3_hex0[30:24];
+assign HEX4 = ~hex5_hex4[ 6: 0];
+assign HEX5 = ~hex5_hex4[14: 8];
+
+
+DELETE all of that and TYPE this instead:
+
+wire        [31: 0] hex3_hex0;
+wire        [15: 0] hex5_hex4;
+
+reg  [3:0] por_cnt  = 4'd0;
+reg        por_n    = 1'b0;
+wire [3:0] debounced_key;
+
+always @(posedge CLOCK_50) begin
+    if (por_cnt != 4'hF) begin
+        por_cnt <= por_cnt + 4'd1;
+        por_n   <= 1'b0;
+    end else begin
+        por_n   <= 1'b1;
+    end
+end
+
+key_debouncer #(.DEBOUNCE_BITS(20)) tinytime_key_deb (
+    .clk           (CLOCK_50),
+    .reset_n       (por_n),
+    .avs_address   (2'd0),
+    .avs_write     (1'b0),
+    .avs_writedata (32'd0),
+    .avs_read      (1'b0),
+    .avs_readdata  (),
+    .key_in        (KEY),
+    .key_out       (debounced_key)
+);
+
+wire [6:0] decoded_hex0, decoded_hex1, decoded_hex2, decoded_hex3;
+wire [6:0] decoded_hex4, decoded_hex5;
+
+bcd_to_7seg seg0 (.bcd(hex3_hex0[15:12]), .seg(decoded_hex0));
+bcd_to_7seg seg1 (.bcd(hex3_hex0[11:8]),  .seg(decoded_hex1));
+bcd_to_7seg seg2 (.bcd(hex3_hex0[7:4]),   .seg(decoded_hex2));
+bcd_to_7seg seg3 (.bcd(hex3_hex0[3:0]),   .seg(decoded_hex3));
+bcd_to_7seg seg4 (.bcd(hex5_hex4[7:4]),   .seg(decoded_hex4));
+bcd_to_7seg seg5 (.bcd(hex5_hex4[3:0]),   .seg(decoded_hex5));
+
+assign HEX0 = ~decoded_hex0;
+assign HEX1 = ~decoded_hex1;
+assign HEX2 = ~decoded_hex2;
+assign HEX3 = ~decoded_hex3;
+assign HEX4 = ~decoded_hex4;
+assign HEX5 = ~decoded_hex5;
+
+
+=====================================================
+EDIT 2 of 2 — Change the pushbuttons line
+=====================================================
+
+FIND this line (around line 235):
+
+    .pushbuttons_export                 (~KEY[3:0]),
+
+CHANGE it to:
+
+    .pushbuttons_export                 (~debounced_key),
+
+
+=====================================================
+DONE. Save the file. That is ALL the edits needed.
+=====================================================

@@ -309,6 +309,24 @@ int hw_discover_addresses(HwAddrs *out)
 }
 
 /*
+ * hw_set_class_addrs
+ * Overwrites with DE10-Standard Computer (class GHRD) addresses.
+ */
+void hw_set_class_addrs(HwAddrs *out)
+{
+    if (!out) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+    set_addr(&out->hex,      CLASS_HEX30_BASE, CLASS_PIO_SPAN, "class-map");
+    set_addr(&out->leds,     CLASS_LEDR_BASE,  CLASS_PIO_SPAN, "class-map");
+    set_addr(&out->switches, CLASS_SW_BASE,    CLASS_PIO_SPAN, "class-map");
+    set_addr(&out->keys,     CLASS_KEY_BASE,   CLASS_PIO_SPAN, "class-map");
+    out->hex_format = HEX_FORMAT_7SEG;
+}
+
+/*
  * hw_print_addrs
  * Prints discovered addresses and formats.
  */
